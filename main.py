@@ -34,6 +34,45 @@ DB_NAME = "faceit.db"
 MAPS = ["Dune", "Province", "Sandstone", "Hanami", "Rust", "Prison", "Breeze",
         "Bridge", "Pool", "Cableway", "Pipeline", "Village", "Arena"]
 
+# ==================== ПРЕМИУМ ЭМОДЗИ (универсальные ID + символ) ====================
+CUSTOM_DIGITS = {
+    "1": "5343941009971650928",
+    "2": "5346144603072403855",
+    "3": "5346327212196927089",
+    "4": "5346175621326217713",
+    "5": "5343740671222132455",   # заменено на подходящий ID
+    "6": "5346037941854574765",
+    "7": "5346013138418440405",
+    "8": "5346252088923951682",
+    "9": "5345993879785084345",
+    "10": "5346102878593940179",  # запасной ID для 10
+}
+
+LEVEL_EMOJI_IDS = [
+    "5343941009971650928",  # Lv.1
+    "5346144603072403855",  # Lv.2
+    "5346327212196927089",  # Lv.3
+    "5346175621326217713",  # Lv.4
+    "5343740671222132455",  # Lv.5
+    "5346037941854574765",  # Lv.6
+    "5346013138418440405",  # Lv.7
+    "5346252088923951682",  # Lv.8
+    "5345993879785084345",  # Lv.9
+]
+
+def number_to_emoji(number: int) -> str:
+    """Возвращает premium-эмодзи цифру для числа 1-10."""
+    ch = str(number)
+    if ch in CUSTOM_DIGITS:
+        return f'<tg-emoji emoji-id="{CUSTOM_DIGITS[ch]}">⭐</tg-emoji>'   # ★ в качестве символа
+    return ch
+
+def level_to_emoji(level: int) -> str:
+    """Возвращает premium-эмодзи уровня FACEIT (1-9)."""
+    idx = max(0, min(level - 1, len(LEVEL_EMOJI_IDS) - 1))
+    emoji_id = LEVEL_EMOJI_IDS[idx]
+    return f'<tg-emoji emoji-id="{emoji_id}">⭐</tg-emoji>'
+
 # ==================== БАЗА ДАННЫХ (устойчивая) ====================
 _db_conn = None
 
@@ -85,6 +124,7 @@ def init_db():
             status TEXT DEFAULT 'open',
             message_id INTEGER,
             duo_user_id INTEGER,
+            connect_link TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             teams_swapped INTEGER DEFAULT 0
         );
@@ -147,9 +187,10 @@ async def run_migrations():
     try:
         lobby_info = await db_fetchall("PRAGMA table_info(lobbies)")
         lobby_cols = {row['name'] for row in lobby_info}
-        if "duo_user_id" not in lobby_cols:
-            await db_execute("ALTER TABLE lobbies ADD COLUMN duo_user_id INTEGER")
-            print("Миграция lobbies: +duo_user_id")
+        for col, col_def in {"duo_user_id":"INTEGER", "connect_link":"TEXT"}.items():
+            if col not in lobby_cols:
+                await db_execute(f"ALTER TABLE lobbies ADD COLUMN {col} {col_def}")
+                print(f"Миграция lobbies: +{col}")
     except:
         pass
     await db_execute("UPDATE users SET elo_5x5=0, elo_2x2=0, elo_1x1=0 WHERE elo_5x5=1000 AND elo_2x2=1000 AND elo_1x1=1000")
@@ -268,6 +309,9 @@ async def get_leader_id() -> int | None:
     row = await db_fetchone("SELECT user_id FROM users WHERE nickname=?", (LEADER_USERNAME,))
     return row['user_id'] if row else None
 
+def get_level(elo: int) -> int:
+    return max(1, elo // 200)
+
 # ==================== СОСТОЯНИЯ ====================
 class AuthStates(StatesGroup):
     waiting_for_choice = State()
@@ -283,6 +327,7 @@ class LobbyStates(StatesGroup):
     choosing_duo = State()
     waiting_duo_nick = State()
     confirm_creation = State()
+    waiting_connect_link = State()
 
 class TicketPlayerStates(StatesGroup):
     nick = State(); description = State(); from_nick = State(); photo = State()
@@ -904,8 +949,11 @@ async def update_lobby_message(bot: Bot, lobby_id: int):
         if acc:
             is_admin_player = await is_admin(uid)
             role = "ADMIN" if is_admin_player else ""
-            elo = player['elo_5x5'] + player['elo_2x2'] + player['elo_1x1'] if player else 0
-            players_list.append(f"{i}. {acc['nickname']} {role} | {elo} ELO")
+            total_elo = player['elo_5x5'] + player['elo_2x2'] + player['elo_1x1'] if player else 0
+            level = get_level(total_elo) if player else 1
+            level_emoji = level_to_emoji(level)
+            num_emoji = number_to_emoji(i)
+            players_list.append(f"{num_emoji}. {level_emoji} {acc['nickname']} {role} | {total_elo} ELO")
     needed = {"5x5":10,"2x2":4,"1x1":2}[fmt]
     text = (f"🔎 Лобби #{lobby_id} | {fmt} | {map_name}\n\n"
             f"👥 Список игроков ({len(players)}/{needed}):\n" + "\n".join(players_list) + f"\n\nХост: {host_name}")
@@ -915,10 +963,10 @@ async def update_lobby_message(bot: Bot, lobby_id: int):
     ])
     if msg_id:
         try:
-            await bot.edit_message_text(text, chat_id=CHANNEL_USERNAME, message_id=msg_id, reply_markup=markup)
+            await bot.edit_message_text(text, chat_id=CHANNEL_USERNAME, message_id=msg_id, reply_markup=markup, parse_mode="HTML")
         except: pass
     else:
-        msg = await bot.send_message(chat_id=CHANNEL_USERNAME, text=text, reply_markup=markup)
+        msg = await bot.send_message(chat_id=CHANNEL_USERNAME, text=text, reply_markup=markup, parse_mode="HTML")
         await db_execute("UPDATE lobbies SET message_id=? WHERE id=?", (msg.message_id, lobby_id))
 
 @dp.callback_query(F.data.startswith("join_"))
@@ -965,7 +1013,7 @@ async def leave_lobby(callback: CallbackQuery, bot: Bot):
         logging.error(traceback.format_exc())
         await callback.answer("Ошибка выхода.", show_alert=True)
 
-# Жеребьёвка с Duo
+# Жеребьёвка с Duo и запросом ссылки
 @dp.callback_query(F.data.startswith("shuffle_"))
 async def shuffle_lobby(callback: CallbackQuery, bot: Bot):
     try:
@@ -998,31 +1046,107 @@ async def shuffle_lobby(callback: CallbackQuery, bot: Bot):
             for u in players[half:]:
                 await db_execute("UPDATE lobby_players SET team=2 WHERE lobby_id=? AND user_id=?", (lid, u))
         await db_execute("UPDATE lobbies SET status='in_progress' WHERE id=?", (lid,))
-        ct_list = []
-        t_list = []
+        ct_list, t_list = [], []
         for p in await db_fetchall("SELECT user_id, team FROM lobby_players WHERE lobby_id=?", (lid,)):
             acc = await db_get_account(p['user_id'])
             name = acc['nickname'] if acc else str(p['user_id'])
-            if p['team'] == 1:
-                ct_list.append(f"👤 {name}")
+            player_data = await db_get_player(p['user_id'])
+            if player_data:
+                level = get_level(player_data['elo_5x5'] + player_data['elo_2x2'] + player_data['elo_1x1'])
             else:
-                t_list.append(f"👤 {name}")
+                level = 1
+            level_icon = level_to_emoji(level)
+            display_name = f"{level_icon} {name}"
+            if p['team'] == 1:
+                ct_list.append(f"👤 {display_name}")
+            else:
+                t_list.append(f"👤 {display_name}")
         text = (f"⚔️ Жеребьёвка лобби #{lid}\n\n🔵 CT:\n" + "\n".join(ct_list) + "\n\n🔴 T:\n" + "\n".join(t_list))
         if lobby['message_id']:
             try:
                 await bot.delete_message(chat_id=CHANNEL_USERNAME, message_id=lobby['message_id'])
             except: pass
-        msg = await bot.send_message(chat_id=CHANNEL_USERNAME, text=text)
+        msg = await bot.send_message(chat_id=CHANNEL_USERNAME, text=text, parse_mode="HTML")
         await db_execute("UPDATE lobbies SET message_id=? WHERE id=?", (msg.message_id, lid))
         for p in await db_fetchall("SELECT user_id, team FROM lobby_players WHERE lobby_id=?", (lid,)):
             try:
                 team = "защите" if p['team'] == 1 else "атаке"
                 await bot.send_message(p['user_id'], f"Лобби #{lid}: вы в {team}. Игра началась!")
             except: pass
+
+        # Кнопка для отправки ссылки
+        await bot.send_message(
+            host_id,
+            f"Отправьте ссылку для подключения к лобби #{lid}.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔗 Отправить ссылку", callback_data=f"send_link_{lid}")]
+            ])
+        )
         await callback.answer("Жеребьёвка проведена!")
     except Exception as e:
         logging.error(traceback.format_exc())
         await callback.answer("Ошибка жеребьёвки.", show_alert=True)
+
+# Обработчик кнопки "Отправить ссылку"
+@dp.callback_query(F.data.startswith("send_link_"))
+async def send_link_callback(callback: CallbackQuery, state: FSMContext):
+    try:
+        lid = int(callback.data.split("_")[2])
+        lobby = await db_fetchone("SELECT host_id FROM lobbies WHERE id=?", (lid,))
+        if not lobby or lobby['host_id'] != callback.from_user.id:
+            await callback.answer("Только хост может отправить ссылку.", show_alert=True)
+            return
+        await state.update_data(link_lobby_id=lid)
+        await callback.message.answer("Введите ссылку для подключения к игре:")
+        await state.set_state(LobbyStates.waiting_connect_link)
+        await callback.answer()
+    except Exception as e:
+        logging.error(traceback.format_exc())
+        await callback.answer("Ошибка.", show_alert=True)
+
+# Приём ссылки и публикация с премиум эмодзи
+@dp.message(LobbyStates.waiting_connect_link)
+async def process_connect_link(message: Message, state: FSMContext, bot: Bot):
+    try:
+        link = message.text.strip()
+        if not link.startswith("http://") and not link.startswith("https://"):
+            await message.answer("Некорректная ссылка. Введите полную ссылку (начинается с http:// или https://).")
+            return
+        data = await state.get_data()
+        lid = data['link_lobby_id']
+        await db_execute("UPDATE lobbies SET connect_link=? WHERE id=?", (link, lid))
+        await state.clear()
+
+        lobby = await db_fetchone("SELECT host_id, format, map, message_id, connect_link FROM lobbies WHERE id=?", (lid,))
+        if not lobby:
+            await message.answer("Лобби не найдено.")
+            return
+        host_acc = await db_get_account(lobby['host_id'])
+        host_name = host_acc['nickname'] if host_acc else str(lobby['host_id'])
+        fmt = lobby['format']
+        map_name = lobby['map']
+        link_text = lobby['connect_link']
+
+        connect_msg = (
+            f"⚡ Подключение к лобби #{lid} | host: {host_name}\n"
+            f"🎮 Режим: {fmt}\n"
+            f"🏞️ Карта: {map_name}\n"
+            f"—————\n"
+            f"🔗 Ссылка для подключения: {link_text}"
+        )
+
+        if lobby['message_id']:
+            try:
+                await bot.delete_message(chat_id=CHANNEL_USERNAME, message_id=lobby['message_id'])
+            except: pass
+        new_msg = await bot.send_message(chat_id=CHANNEL_USERNAME, text=connect_msg)
+        await db_execute("UPDATE lobbies SET message_id=? WHERE id=?", (new_msg.message_id, lid))
+
+        await message.answer("✅ Ссылка для подключения отправлена в канал.", reply_markup=main_keyboard())
+    except Exception as e:
+        logging.error(traceback.format_exc())
+        await state.clear()
+        await message.answer("Ошибка при сохранении ссылки.")
 
 # Поиск матча
 @dp.message(F.text == "🔍 Найти матч")
@@ -1045,7 +1169,7 @@ async def find_match(message: Message):
         logging.error(traceback.format_exc())
         await message.answer("Ошибка поиска лобби.")
 
-# Результаты (исправленное распределение)
+# Результаты
 @dp.message(Command("results"))
 async def results_start(message: Message, state: FSMContext):
     try:
@@ -1471,7 +1595,7 @@ async def reglament(message: Message):
             "2.1 Оскорбления – бан.\n2.2 Жалобы на админов – через тикет.\n2.3 Выход из матча – бан 5ч.\n2.4 Руина – бан.\n2.5 Провокации – бан 1ч.\n2.6 Оскорбление религии – вплоть до навсегда.")
     await message.answer(text)
 
-# Админ-панель
+# Админ-панель (все функции)
 @dp.message(F.text == "🛠 Админ-панель")
 async def admin_panel(message: Message):
     if not await is_admin(message.from_user.id):
