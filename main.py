@@ -78,6 +78,7 @@ def init_db():
             map TEXT,
             status TEXT DEFAULT 'open',
             message_id INTEGER,
+            duo_user_id INTEGER,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             teams_swapped INTEGER DEFAULT 0
         );
@@ -129,7 +130,6 @@ async def run_migrations():
         "deaths": "INTEGER DEFAULT 0",
         "avatar_file_id": "TEXT",
     }
-
     try:
         existing_info = await db_fetchall("PRAGMA table_info(users)")
         existing_columns = {row['name'] for row in existing_info}
@@ -144,12 +144,20 @@ async def run_migrations():
             except Exception as e:
                 print(f"Не удалось добавить колонку {col_name}: {e}")
 
-    # Сброс старых ELO со 1000 на 0
+    # Добавление duo_user_id в lobbies, если её нет
+    try:
+        lobby_info = await db_fetchall("PRAGMA table_info(lobbies)")
+        lobby_cols = {row['name'] for row in lobby_info}
+        if "duo_user_id" not in lobby_cols:
+            await db_execute("ALTER TABLE lobbies ADD COLUMN duo_user_id INTEGER")
+            print("Миграция: добавлена колонка duo_user_id в lobbies")
+    except:
+        pass
+
     await db_execute("""
         UPDATE users SET elo_5x5 = 0, elo_2x2 = 0, elo_1x1 = 0
         WHERE elo_5x5 = 1000 AND elo_2x2 = 1000 AND elo_1x1 = 1000
     """)
-    # Руководителю всегда разрешено создавать лобби
     leader = await db_fetchone("SELECT user_id FROM users WHERE nickname = ?", (LEADER_USERNAME,))
     if leader:
         await db_execute("UPDATE users SET can_create_lobby = 1 WHERE user_id = ?", (leader['user_id'],))
@@ -308,6 +316,8 @@ class AuthStates(StatesGroup):
 class LobbyStates(StatesGroup):
     choosing_format = State()
     choosing_map = State()
+    choosing_duo = State()
+    waiting_duo_nick = State()
     confirm_creation = State()
 
 class TicketPlayerStates(StatesGroup):
@@ -728,15 +738,68 @@ async def map_chosen(callback: CallbackQuery, state: FSMContext):
     map_name = callback.data.split("_",1)[1]
     data = await state.get_data()
     fmt = data['format']
-    guide = {
-        "5x5": "1. Выберите формат «Турнир»\n2. 13 раундов\n3. Баланс до 16к",
-        "2x2": "1. Формат «Союзники»\n2. 13 раундов\n3. Баланс 16к",
-        "1x1": "1. Формат «Дуэли»\n2. Раунды по умолчанию"
-    }
-    text = f"⚙️ Настройки ({fmt})\n\n{guide[fmt]}\n\nКарта: {map_name}\nГотов создать лобби?"
     await state.update_data(map=map_name)
-    await callback.message.delete()
-    await callback.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+
+    if fmt == "2x2":
+        await callback.message.delete()
+        await callback.message.answer(
+            "Хотите играть Duo с другом? (вы будете в одной команде)",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Да, ввести друга", callback_data="duo_yes")],
+                [InlineKeyboardButton(text="❌ Нет, пропустить", callback_data="duo_no")]
+            ])
+        )
+        await state.set_state(LobbyStates.choosing_duo)
+    else:
+        guide = {
+            "5x5": "1. Выберите формат «Турнир»\n2. 13 раундов\n3. Баланс до 16к",
+            "2x2": "1. Формат «Союзники»\n2. 13 раундов\n3. Баланс 16к",
+            "1x1": "1. Формат «Дуэли»\n2. Раунды по умолчанию"
+        }
+        text = f"⚙️ Настройки ({fmt})\n\n{guide[fmt]}\n\nКарта: {map_name}\nГотов создать лобби?"
+        await callback.message.delete()
+        await callback.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Создать", callback_data="create_lobby")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_lobby")]
+        ]))
+        await state.set_state(LobbyStates.confirm_creation)
+
+@dp.callback_query(LobbyStates.choosing_duo, F.data.in_(["duo_yes", "duo_no"]))
+async def duo_choice(callback: CallbackQuery, state: FSMContext):
+    if callback.data == "duo_no":
+        data = await state.get_data()
+        fmt = data['format']
+        map_name = data['map']
+        guide = {"2x2": "1. Формат «Союзники»\n2. 13 раундов\n3. Баланс 16к"}
+        text = f"⚙️ Настройки ({fmt})\n\n{guide[fmt]}\n\nКарта: {map_name}\nГотов создать лобби?"
+        await callback.message.delete()
+        await callback.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Создать", callback_data="create_lobby")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_lobby")]
+        ]))
+        await state.set_state(LobbyStates.confirm_creation)
+    else:
+        await callback.message.edit_text("Введите ник друга для Duo:")
+        await state.set_state(LobbyStates.waiting_duo_nick)
+
+@dp.message(LobbyStates.waiting_duo_nick)
+async def process_duo_nick(message: Message, state: FSMContext):
+    nick = message.text.strip()
+    duo_id = await find_user_by_nickname(nick)
+    if not duo_id:
+        await message.answer("Игрок с таким ником не найден. Попробуйте ещё раз.")
+        return
+    if duo_id == message.from_user.id:
+        await message.answer("Нельзя выбрать себя как Duo-партнёра. Введите другой ник.")
+        return
+
+    await state.update_data(duo_user_id=duo_id)
+    data = await state.get_data()
+    fmt = data['format']
+    map_name = data['map']
+    guide = {"2x2": "1. Формат «Союзники»\n2. 13 раундов\n3. Баланс 16к"}
+    text = f"⚙️ Настройки ({fmt})\n\n{guide[fmt]}\n\nКарта: {map_name}\n👥 Duo: {nick}\nГотов создать лобби?"
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Создать", callback_data="create_lobby")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_lobby")]
     ]))
@@ -745,11 +808,15 @@ async def map_chosen(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(LobbyStates.confirm_creation, F.data == "create_lobby")
 async def lobby_created(callback: CallbackQuery, state: FSMContext, bot: Bot):
     data = await state.get_data()
-    fmt, map_name = data['format'], data['map']
+    fmt = data['format']
+    map_name = data['map']
     host_id = callback.from_user.id
+    duo_id = data.get('duo_user_id')
+
     def _create():
         conn = _get_conn()
-        cur = conn.execute("INSERT INTO lobbies (host_id, format, map) VALUES (?,?,?)", (host_id, fmt, map_name))
+        cur = conn.execute("INSERT INTO lobbies (host_id, format, map, duo_user_id) VALUES (?,?,?,?)",
+                           (host_id, fmt, map_name, duo_id))
         lid = cur.lastrowid
         conn.execute("INSERT INTO lobby_players VALUES (?,?,0)", (lid, host_id))
         conn.commit()
@@ -809,7 +876,6 @@ async def update_lobby_message(bot: Bot, lobby_id: int):
 async def join_lobby(callback: CallbackQuery, bot: Bot):
     lid = int(callback.data.split("_")[1])
     uid = callback.from_user.id
-    # Проверка авторизации
     if not await db_fetchone("SELECT is_logged_in FROM users WHERE user_id = ? AND is_logged_in = 1", (uid,)):
         await callback.answer("Сначала войдите в аккаунт через /start", show_alert=True)
         return
@@ -846,21 +912,48 @@ async def leave_lobby(callback: CallbackQuery, bot: Bot):
 @dp.callback_query(F.data.startswith("shuffle_"))
 async def shuffle_lobby(callback: CallbackQuery, bot: Bot):
     lid = int(callback.data.split("_")[1])
-    lobby = await db_fetchone("SELECT host_id, format, map, message_id FROM lobbies WHERE id=?", (lid,))
+    lobby = await db_fetchone("SELECT host_id, format, map, message_id, duo_user_id FROM lobbies WHERE id=?", (lid,))
     if not lobby or lobby['host_id'] != callback.from_user.id:
         await callback.answer("Только хост.", show_alert=True)
         return
+
     players = [r['user_id'] for r in await db_fetchall("SELECT user_id FROM lobby_players WHERE lobby_id=?", (lid,))]
-    random.shuffle(players)
-    half = len(players)//2
-    for u in players[:half]:
-        await db_execute("UPDATE lobby_players SET team=1 WHERE lobby_id=? AND user_id=?", (lid, u))
-    for u in players[half:]:
-        await db_execute("UPDATE lobby_players SET team=2 WHERE lobby_id=? AND user_id=?", (lid, u))
+    duo_id = lobby['duo_user_id']
+    host_id = lobby['host_id']
+
+    if duo_id and duo_id in players and host_id in players:
+        players.remove(host_id)
+        players.remove(duo_id)
+        random.shuffle(players)
+        half = len(players) // 2
+        team1_extra = players[:half]
+        team2_extra = players[half:]
+
+        for uid in team1_extra:
+            await db_execute("UPDATE lobby_players SET team=1 WHERE lobby_id=? AND user_id=?", (lid, uid))
+        for uid in team2_extra:
+            await db_execute("UPDATE lobby_players SET team=2 WHERE lobby_id=? AND user_id=?", (lid, uid))
+        await db_execute("UPDATE lobby_players SET team=1 WHERE lobby_id=? AND user_id=?", (lid, host_id))
+        await db_execute("UPDATE lobby_players SET team=1 WHERE lobby_id=? AND user_id=?", (lid, duo_id))
+    else:
+        random.shuffle(players)
+        half = len(players)//2
+        for u in players[:half]:
+            await db_execute("UPDATE lobby_players SET team=1 WHERE lobby_id=? AND user_id=?", (lid, u))
+        for u in players[half:]:
+            await db_execute("UPDATE lobby_players SET team=2 WHERE lobby_id=? AND user_id=?", (lid, u))
+
     await db_execute("UPDATE lobbies SET status='in_progress' WHERE id=?", (lid,))
 
-    ct_list = [f"👤 {(await db_get_account(u))['nickname']}" if (await db_get_account(u)) else f"ID {u}" for u in players[:half]]
-    t_list = [f"👤 {(await db_get_account(u))['nickname']}" if (await db_get_account(u)) else f"ID {u}" for u in players[half:]]
+    ct_list = []
+    t_list = []
+    for p in await db_fetchall("SELECT user_id, team FROM lobby_players WHERE lobby_id=?", (lid,)):
+        acc = await db_get_account(p['user_id'])
+        name = acc['nickname'] if acc else str(p['user_id'])
+        if p['team'] == 1:
+            ct_list.append(f"👤 {name}")
+        else:
+            t_list.append(f"👤 {name}")
 
     text = (f"⚔️ Жеребьёвка лобби #{lid}\n\n🔵 CT:\n" + "\n".join(ct_list) + "\n\n🔴 T:\n" + "\n".join(t_list))
     if lobby['message_id']:
@@ -870,10 +963,11 @@ async def shuffle_lobby(callback: CallbackQuery, bot: Bot):
             pass
     msg = await bot.send_message(chat_id=CHANNEL_USERNAME, text=text)
     await db_execute("UPDATE lobbies SET message_id=? WHERE id=?", (msg.message_id, lid))
-    for u in players:
+
+    for p in await db_fetchall("SELECT user_id, team FROM lobby_players WHERE lobby_id=?", (lid,)):
         try:
-            team = "защите" if u in players[:half] else "атаке"
-            await bot.send_message(u, f"Лобби #{lid}: вы в {team}. Игра началась!")
+            team = "защите" if p['team'] == 1 else "атаке"
+            await bot.send_message(p['user_id'], f"Лобби #{lid}: вы в {team}. Игра началась!")
         except:
             pass
     await callback.answer("Жеребьёвка проведена!")
@@ -894,7 +988,7 @@ async def find_match(message: Message):
         ])
         await message.answer(f"Лобби #{lid} ({fmt}) {mn}\n{count}/{needed}", reply_markup=markup)
 
-# --- РЕЗУЛЬТАТЫ ---
+# --- РЕЗУЛЬТАТЫ (исправленное распределение по командам) ---
 @dp.message(Command("results"))
 async def results_start(message: Message, state: FSMContext):
     await message.answer("Введите номер лобби:")
@@ -963,7 +1057,7 @@ async def results_swap(callback: CallbackQuery, state: FSMContext, bot: Bot):
     for p in players:
         uid = p['user_id']
         player_team = (await db_fetchone("SELECT team FROM lobby_players WHERE lobby_id=? AND user_id=?", (lid, uid)))['team']
-        actual_team = 2 if (player_team == 1 and swapped) or (player_team == 2 and not swapped) else player_team
+        actual_team = (3 - player_team) if swapped else player_team
         premium = await is_premium(uid)
         bonus = 50 if premium else 25
         if actual_team == winner_team:
@@ -976,10 +1070,13 @@ async def results_swap(callback: CallbackQuery, state: FSMContext, bot: Bot):
         uid = p['user_id']
         acc = await db_get_account(uid)
         player_team = (await db_fetchone("SELECT team FROM lobby_players WHERE lobby_id=? AND user_id=?", (lid, uid)))['team']
-        actual_team = 2 if (player_team == 1 and swapped) or (player_team == 2 and not swapped) else player_team
+        actual_team = (3 - player_team) if swapped else player_team
         player = await db_get_player(uid)
         elo = player[elo_field] if player else 0
-        (ct_list if actual_team == 1 else t_list).append(f"{len(ct_list if actual_team==1 else t_list)+1}. {acc['nickname']} (ELO: {elo})")
+        if actual_team == 1:
+            ct_list.append(f"{len(ct_list)+1}. {acc['nickname']} (ELO: {elo})")
+        else:
+            t_list.append(f"{len(t_list)+1}. {acc['nickname']} (ELO: {elo})")
 
     await db_execute("INSERT INTO matches (lobby_id, host_id, map, ct_score, t_score, teams_swapped, screenshot_id) VALUES (?,?,?,?,?,?,?)",
                      (lid, host_id, map_name, ct_score, t_score, int(swapped), screenshot))
